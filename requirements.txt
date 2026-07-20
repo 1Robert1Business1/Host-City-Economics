@@ -1,0 +1,27 @@
+# Host-City Economics — pinned dependencies
+#
+# Python >=3.10 required (the `differences` package). Built and verified on
+# CPython 3.12.10, Windows. Versions below are the exact set pip resolved and
+# that was confirmed to import cleanly together (numpy 2.x / pandas 3.x era).
+#
+# Reproduce:  py -3.12 -m venv .venv
+#             .\.venv\Scripts\Activate.ps1        # PowerShell
+#             pip install -r requirements.txt
+
+# --- Causal / econometrics stack (the point of the project) ---
+differences==0.3.0        # Callaway & Sant'Anna estimator (staggered DiD, group-time ATTs)
+pyfixest==0.60.0          # fast fixed-effects / TWFE baselines
+linearmodels==7.0         # panel FE, IV, additional TWFE machinery
+statsmodels==0.14.6       # canonical 2x2 DiD, OLS, inference
+scipy==1.18.0             # statistical primitives, distributions
+
+# --- Data / numerics ---
+pandas==3.0.3
+numpy==2.5.1
+
+# --- Visualisation ---
+matplotlib==3.11.1        # event-study and diagnostic figures
+
+# --- Notebook environment ---
+jupyterlab==4.6.1
+ipykernel==7.3.0

@@ -1,0 +1,36 @@
+# --- Python virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Byte-compiled / caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ipynb_checkpoints/
+.mypy_cache/
+.ruff_cache/
+
+# --- Jupyter ---
+*.nbconvert.ipynb
+profile_default/
+ipython_config.py
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Large / regenerable data ---
+# Small QCEW extracts and the synthetic panel are committed on purpose
+# (reproducibility); anything bulky or re-downloadable is not.
+data/raw/
+*.zip
+*.parquet
+
+# --- Distribution ---
+build/
+dist/
+*.egg-info/
