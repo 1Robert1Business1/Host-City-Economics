@@ -391,4 +391,391 @@ def pretrends_test(
     )
 
 
-__all__ = ["DiD2x2Result", "did_2x2", "PretrendsResult", "pretrends_test"]
+# --------------------------------------------------------------------------- #
+# Naive two-way fixed effects (the biased baseline)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class TWFEResult:
+    """Result of a static two-way fixed-effects DiD regression."""
+
+    att: float
+    se: float
+    pvalue: float
+    ci_lower: float
+    ci_upper: float
+    alpha: float
+    n_obs: int
+    cluster: bool
+
+    def contains(self, value: float) -> bool:
+        """Whether the confidence interval covers ``value``."""
+        return bool(self.ci_lower <= value <= self.ci_upper)
+
+    def summary(self, truth: float | None = None) -> str:
+        pct = int(round((1 - self.alpha) * 100))
+        lines = [
+            "Naive two-way fixed effects (static)",
+            f"  Estimate         : {self.att:+.4f}",
+            f"  Std. error       : {self.se:.4f}"
+            f" ({'clustered by unit' if self.cluster else 'unclustered'})",
+            f"  {pct}% CI           : [{self.ci_lower:+.4f}, {self.ci_upper:+.4f}]",
+            f"  N                : {self.n_obs} obs",
+        ]
+        if truth is not None:
+            lines += [
+                f"  True ATT         : {truth:+.4f}",
+                f"  Bias             : {self.att - truth:+.4f}"
+                f"  ({(self.att - truth) / truth * 100:+.1f}%)",
+                f"  CI covers truth  : {'YES' if self.contains(truth) else 'NO'}",
+            ]
+        return "\n".join(lines)
+
+    def __str__(self) -> str:  # pragma: no cover
+        return self.summary()
+
+
+def twfe_did(
+    data: pd.DataFrame,
+    *,
+    outcome: str = "y",
+    unit: str = "city",
+    time: str = "period",
+    treatment: str = "d",
+    cluster: bool = True,
+    alpha: float = 0.05,
+) -> TWFEResult:
+    """Estimate the static TWFE DiD: ``y ~ D | unit + time`` (via pyfixest).
+
+    This is the estimator the modern staggered-DiD literature warns about
+    (PROJECT_BRIEF.md §5.3). Under staggered timing with heterogeneous effects
+    it implicitly uses already-treated units as controls for later-treated ones
+    — "forbidden comparisons" — and is biased. It is included precisely so the
+    bias can be *shown* rather than asserted.
+
+    ``treatment`` must be the treated-and-post indicator (1 while a unit is
+    under treatment), not the ever-treated group flag.
+    """
+    import pyfixest as pf
+
+    required = {outcome, unit, time, treatment}
+    missing = required - set(data.columns)
+    if missing:
+        raise KeyError(f"data is missing required column(s): {sorted(missing)}")
+
+    fml = f"{outcome} ~ {treatment} | {unit} + {time}"
+    vcov = {"CRV1": unit} if cluster else "iid"
+    fit = pf.feols(fml, data=data, vcov=vcov)
+
+    tidy = fit.tidy()
+    row = tidy.loc[treatment]
+    lo_col, hi_col = f"{alpha / 2 * 100:g}%", f"{(1 - alpha / 2) * 100:g}%"
+    if lo_col in tidy.columns and hi_col in tidy.columns:
+        ci_lower, ci_upper = float(row[lo_col]), float(row[hi_col])
+    else:  # non-default alpha: fall back to the fitted CI at that level
+        ci = fit.confint(alpha=alpha)
+        ci_lower, ci_upper = float(ci.loc[treatment].iloc[0]), float(ci.loc[treatment].iloc[1])
+
+    return TWFEResult(
+        att=float(row["Estimate"]),
+        se=float(row["Std. Error"]),
+        pvalue=float(row["Pr(>|t|)"]),
+        ci_lower=ci_lower,
+        ci_upper=ci_upper,
+        alpha=alpha,
+        n_obs=int(data.shape[0]),
+        cluster=cluster,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Callaway & Sant'Anna
+# --------------------------------------------------------------------------- #
+def _flatten_cs(df: pd.DataFrame) -> pd.DataFrame:
+    """Flatten the `differences` MultiIndex columns to their leaf names."""
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [c[-1] if isinstance(c, tuple) else c for c in out.columns]
+    return out
+
+
+@dataclass(frozen=True)
+class CSResult:
+    """Result of a Callaway & Sant'Anna (2021) estimation."""
+
+    att: float
+    """Overall ATT (the 'simple' aggregation)."""
+
+    se: float
+    ci_lower: float
+    ci_upper: float
+    alpha: float
+    group_time: pd.DataFrame
+    """Group-time ATT(g,t) table."""
+
+    event_study: pd.DataFrame
+    """Event-study aggregation: columns ``relative_period``, ``ATT``,
+    ``std_error``, ``lower``, ``upper``."""
+
+    def contains(self, value: float) -> bool:
+        """Whether the overall-ATT confidence interval covers ``value``."""
+        return bool(self.ci_lower <= value <= self.ci_upper)
+
+    def summary(self, truth: float | None = None) -> str:
+        pct = int(round((1 - self.alpha) * 100))
+        lines = [
+            "Callaway & Sant'Anna (staggered-robust)",
+            f"  Overall ATT      : {self.att:+.4f}",
+            f"  Std. error       : {self.se:.4f}",
+            f"  {pct}% CI           : [{self.ci_lower:+.4f}, {self.ci_upper:+.4f}]",
+        ]
+        if truth is not None:
+            lines += [
+                f"  True ATT         : {truth:+.4f}",
+                f"  Error            : {self.att - truth:+.4f}"
+                f"  ({(self.att - truth) / truth * 100:+.1f}%)",
+                f"  CI covers truth  : {'YES' if self.contains(truth) else 'NO'}",
+            ]
+        return "\n".join(lines)
+
+    def __str__(self) -> str:  # pragma: no cover
+        return self.summary()
+
+
+def callaway_santanna(
+    data: pd.DataFrame,
+    *,
+    outcome: str = "y",
+    unit: str = "city",
+    time: str = "period",
+    cohort: str = "cohort",
+    control_group: str = "never_treated",
+    est_method: str = "dr",
+    alpha: float = 0.05,
+    boot_iterations: int = 0,
+    random_state: int | None = None,
+) -> CSResult:
+    """Estimate group-time ATTs with Callaway & Sant'Anna via `differences`.
+
+    The estimator that fixes what TWFE breaks (PROJECT_BRIEF.md §5.3). It
+    estimates a separate ATT(g,t) for every cohort-period cell using only
+    *clean* comparisons — never-treated (or not-yet-treated) units — and then
+    aggregates. No already-treated unit is ever used as a control, so the
+    forbidden comparisons that bias TWFE cannot arise.
+
+    Parameters
+    ----------
+    cohort
+        Column holding each unit's treatment period, ``NaN`` for never-treated.
+    control_group
+        ``'never_treated'`` or ``'not_yet_treated'``.
+    est_method
+        ``differences`` estimation method; ``'dr'`` is doubly-robust.
+    boot_iterations
+        If > 0, use the multiplier bootstrap for uniform confidence bands.
+    """
+    from differences import ATTgt
+
+    required = {outcome, unit, time, cohort}
+    missing = required - set(data.columns)
+    if missing:
+        raise KeyError(f"data is missing required column(s): {sorted(missing)}")
+
+    panel = data.set_index([unit, time])
+
+    att = ATTgt(data=panel, cohort_column=cohort)
+    att.fit(
+        f"{outcome} ~ 1",
+        est_method=est_method,
+        control_group=control_group,
+        alpha=alpha,
+        boot_iterations=boot_iterations,
+        random_state=random_state,
+        progress_bar=False,
+    )
+
+    simple = _flatten_cs(att.aggregate("simple", alpha=alpha))
+    event = _flatten_cs(att.aggregate("event", alpha=alpha)).reset_index()
+    group_time = _flatten_cs(att.results())
+
+    row = simple.iloc[0]
+    return CSResult(
+        att=float(row["ATT"]),
+        se=float(row["std_error"]),
+        ci_lower=float(row["lower"]),
+        ci_upper=float(row["upper"]),
+        alpha=alpha,
+        group_time=group_time,
+        event_study=event,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Goodman-Bacon decomposition — the mechanism behind the TWFE bias
+# --------------------------------------------------------------------------- #
+def _means_2x2(
+    frame: pd.DataFrame, outcome: str, treated_mask: np.ndarray, post_mask: np.ndarray
+) -> float:
+    """Group-means 2x2 DiD on a subsample."""
+    y = frame[outcome].to_numpy()
+    tp = y[treated_mask & post_mask].mean()
+    tq = y[treated_mask & ~post_mask].mean()
+    cp = y[~treated_mask & post_mask].mean()
+    cq = y[~treated_mask & ~post_mask].mean()
+    return float((tp - tq) - (cp - cq))
+
+
+def goodman_bacon(
+    data: pd.DataFrame,
+    *,
+    outcome: str = "y",
+    unit: str = "city",
+    time: str = "period",
+    cohort: str = "cohort",
+) -> pd.DataFrame:
+    """Decompose the static TWFE estimate into its underlying 2x2 comparisons.
+
+    Goodman-Bacon (2021) shows the TWFE coefficient is a weighted average of
+    every possible 2x2 DiD in the data. Three kinds arise under staggered
+    timing:
+
+      * **treated vs never-treated** — a clean comparison;
+      * **earlier vs later** (the later cohort not yet treated) — also clean;
+      * **later vs earlier** (the earlier cohort *already treated*, serving as
+        the control) — the **forbidden comparison**. When the already-treated
+        control's own effect is still growing, that growth is subtracted from
+        the later cohort's change and the 2x2 is biased downward, dragging the
+        TWFE average with it.
+
+    Requires a balanced panel and no covariates, in which case the weighted sum
+    of the comparisons reproduces the TWFE coefficient exactly — which is used
+    as a built-in correctness check in the notebook.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per comparison with columns ``kind``, ``treated_group``,
+        ``control_group``, ``estimate``, ``weight``, ``forbidden``.
+    """
+    d = data[[outcome, unit, time, cohort]].copy()
+    periods = np.sort(d[time].unique())
+    n_periods = len(periods)
+
+    units = d[[unit, cohort]].drop_duplicates(subset=unit)
+    n_total = len(units)
+
+    treated_cohorts = np.sort(units[cohort].dropna().unique())
+    has_never = units[cohort].isna().any()
+
+    def share(g: float | None) -> float:
+        if g is None:
+            return float(units[cohort].isna().sum()) / n_total
+        return float((units[cohort] == g).sum()) / n_total
+
+    def dbar(g: float | None) -> float:
+        """Fraction of periods the group spends treated."""
+        if g is None:
+            return 0.0
+        return float((periods >= g).sum()) / n_periods
+
+    rows: list[dict] = []
+
+    # (1) each treated cohort vs the never-treated group
+    if has_never:
+        n_u = share(None)
+        never_mask_units = set(units.loc[units[cohort].isna(), unit])
+        for g in treated_cohorts:
+            n_k = share(g)
+            sub = d[(d[cohort] == g) | (d[cohort].isna())]
+            treated_mask = (sub[cohort] == g).to_numpy()
+            post_mask = (sub[time] >= g).to_numpy()
+            est = _means_2x2(sub, outcome, treated_mask, post_mask)
+            nhat = n_k / (n_k + n_u)
+            dk = dbar(g)
+            num = (n_k + n_u) ** 2 * nhat * (1 - nhat) * dk * (1 - dk)
+            rows.append(
+                {
+                    "kind": "treated vs never-treated",
+                    "treated_group": g,
+                    "control_group": np.nan,
+                    "estimate": est,
+                    "_num": num,
+                    "forbidden": False,
+                }
+            )
+        del never_mask_units
+
+    # (2) timing pairs
+    for i, g_k in enumerate(treated_cohorts):
+        for g_l in treated_cohorts[i + 1 :]:
+            n_k, n_l = share(g_k), share(g_l)
+            dk, dl = dbar(g_k), dbar(g_l)
+            nhat = n_k / (n_k + n_l)
+            pair = d[(d[cohort] == g_k) | (d[cohort] == g_l)]
+
+            # (2a) earlier vs later, restricted to before the later adopts
+            win = pair[pair[time] < g_l]
+            est_early = _means_2x2(
+                win, outcome,
+                (win[cohort] == g_k).to_numpy(),
+                (win[time] >= g_k).to_numpy(),
+            )
+            num_early = (
+                ((n_k + n_l) * (1 - dl)) ** 2
+                * nhat * (1 - nhat)
+                * ((dk - dl) / (1 - dl))
+                * ((1 - dk) / (1 - dl))
+            )
+            rows.append(
+                {
+                    "kind": "earlier vs later (not yet treated)",
+                    "treated_group": g_k,
+                    "control_group": g_l,
+                    "estimate": est_early,
+                    "_num": num_early,
+                    "forbidden": False,
+                }
+            )
+
+            # (2b) later vs earlier — the FORBIDDEN comparison
+            win = pair[pair[time] >= g_k]
+            est_late = _means_2x2(
+                win, outcome,
+                (win[cohort] == g_l).to_numpy(),
+                (win[time] >= g_l).to_numpy(),
+            )
+            num_late = (
+                ((n_k + n_l) * dk) ** 2
+                * nhat * (1 - nhat)
+                * (dl / dk)
+                * ((dk - dl) / dk)
+            )
+            rows.append(
+                {
+                    "kind": "later vs earlier (ALREADY treated)",
+                    "treated_group": g_l,
+                    "control_group": g_k,
+                    "estimate": est_late,
+                    "_num": num_late,
+                    "forbidden": True,
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    out["weight"] = out["_num"] / out["_num"].sum()
+    out = out.drop(columns="_num")
+    return out[
+        ["kind", "treated_group", "control_group", "estimate", "weight", "forbidden"]
+    ]
+
+
+__all__ = [
+    "DiD2x2Result",
+    "did_2x2",
+    "PretrendsResult",
+    "pretrends_test",
+    "TWFEResult",
+    "twfe_did",
+    "CSResult",
+    "callaway_santanna",
+    "goodman_bacon",
+]
