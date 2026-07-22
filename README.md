@@ -34,7 +34,7 @@ host-city-economics/
 │   ├── config.py          # seeds + paths — single source of reproducibility
 │   ├── generate_panel.py  # seeded synthetic panel (known planted effects)
 │   ├── data_prep.py       # QCEW download, county→metro aggregation
-│   └── did.py             # reusable DiD / event-study / CS-estimator functions
+│   └── did.py             # reusable 2x2 DiD + pre-trends check (event study / CS later)
 ├── notebooks/
 │   ├── 01_synthetic-validation.ipynb
 │   ├── 02_data-and-design.ipynb
