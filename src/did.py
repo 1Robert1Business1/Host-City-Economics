@@ -23,6 +23,7 @@ addresses it are taken up in Stage 4.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -550,6 +551,7 @@ def callaway_santanna(
     cohort: str = "cohort",
     control_group: str = "never_treated",
     est_method: str = "dr",
+    base_period: str = "varying",
     alpha: float = 0.05,
     boot_iterations: int = 0,
     random_state: int | None = None,
@@ -582,7 +584,7 @@ def callaway_santanna(
 
     panel = data.set_index([unit, time])
 
-    att = ATTgt(data=panel, cohort_column=cohort)
+    att = ATTgt(data=panel, cohort_column=cohort, base_period=base_period)
     att.fit(
         f"{outcome} ~ 1",
         est_method=est_method,
@@ -768,6 +770,177 @@ def goodman_bacon(
     ]
 
 
+# --------------------------------------------------------------------------- #
+# Stacked event study (matched design) with a joint pre-trends Wald test
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class StackedEventStudy:
+    """Result of a stacked (Cengiz et al. 2019) event-study estimation."""
+
+    coefs: pd.DataFrame
+    """Event-time coefficients: ``event_time``, ``estimate``, ``se``,
+    ``ci_lower``, ``ci_upper`` (the reference period is included at 0)."""
+
+    pretrends_stat: float
+    """Joint Wald statistic that all pre-treatment leads are zero (chi-square)."""
+
+    pretrends_pvalue: float
+    pretrends_df: int
+    pre_rms: float
+    """Root-mean-square of the pre-treatment lead coefficients (effect-size view)."""
+
+    n_stacks: int
+    n_obs: int
+    k_pre: int
+    k_post: int
+    ref: int
+    alpha: float
+
+    @property
+    def passes(self) -> bool:
+        """Fail to reject the joint null of no differential pre-trends."""
+        return bool(self.pretrends_pvalue > self.alpha)
+
+    def summary(self) -> str:
+        verdict = (
+            "PASS - no evidence of differential pre-trends"
+            if self.passes
+            else "FAIL - pre-trends differ; design contaminated"
+        )
+        return "\n".join(
+            [
+                "Stacked event study (matched controls)",
+                f"  sub-experiments  : {self.n_stacks}",
+                f"  window           : [{-self.k_pre}, +{self.k_post}] (ref {self.ref})",
+                f"  pre-trend RMS    : {self.pre_rms:.4f} log points",
+                f"  joint Wald chi2  : {self.pretrends_stat:.3f} (df {self.pretrends_df})",
+                f"  joint p-value    : {self.pretrends_pvalue:.4f}",
+                f"  verdict (a={self.alpha:g}) : {verdict}",
+            ]
+        )
+
+    def __str__(self) -> str:  # pragma: no cover
+        return self.summary()
+
+
+def stacked_event_study(
+    panel: pd.DataFrame,
+    matches: dict[str, list[str]],
+    *,
+    outcome: str = "log_lh",
+    unit: str = "metro",
+    time: str = "period",
+    cohort: str = "cohort",
+    k_pre: int = 8,
+    k_post: int = 6,
+    ref: int = -1,
+    cluster: bool = True,
+    alpha: float = 0.05,
+) -> StackedEventStudy:
+    """Stacked event study for a matched treated-vs-control design.
+
+    For each treated unit (a key of ``matches``) a "clean" 2x2-style
+    sub-experiment is built from that unit and *its own* matched controls over
+    the event window ``[cohort - k_pre, cohort + k_post]``; the sub-experiments
+    are stacked and estimated jointly with sub-experiment-specific unit and
+    time fixed effects (Cengiz, Dube, Lindner & Zipperer 2019). This realises
+    the matched-control strategy exactly — each host is compared only with its
+    matches — and avoids the "forbidden comparisons" TWFE makes under staggered
+    timing.
+
+    The event-time coefficients are relative to ``ref`` (default the quarter
+    before treatment). The pre-treatment leads (event time < ``ref``) are jointly
+    tested against zero: this is the parallel-trends check.
+
+    Standard errors are clustered on ``unit`` by default. With few treated
+    clusters the cluster-robust variance is anti-conservative (the few-clusters
+    problem, PROJECT_BRIEF.md §5.4) -- flagged here and addressed with a wild
+    cluster bootstrap in Stage 4.
+    """
+    import pyfixest as pf
+    from scipy import stats
+
+    cohort_of = panel.dropna(subset=[cohort]).groupby(unit)[cohort].first().to_dict()
+
+    parts = []
+    for host, controls in matches.items():
+        g = cohort_of.get(host)
+        if g is None:
+            raise ValueError(f"{host} has no cohort in the panel")
+        members = [host, *controls]
+        sub = panel[
+            panel[unit].isin(members)
+            & panel[time].between(g - k_pre, g + k_post)
+        ].copy()
+        sub["event_time"] = (sub[time] - g).astype(int)
+        sub["treated_num"] = (sub[unit] == host).astype(int)
+        sub["stack_id"] = host
+        parts.append(sub)
+
+    stack = pd.concat(parts, ignore_index=True)
+    stack["unit_stack"] = stack[unit] + "__" + stack["stack_id"]
+    stack["time_stack"] = stack[time].astype(str) + "__" + stack["stack_id"]
+
+    vcov = {"CRV1": unit} if cluster else "iid"
+    fit = pf.feols(
+        f"{outcome} ~ i(event_time, treated_num, ref={ref}) "
+        f"| unit_stack + time_stack",
+        data=stack,
+        vcov=vcov,
+    )
+
+    tidy = fit.tidy()
+    names = list(tidy.index)
+    et = {}
+    for nm in names:
+        m = re.search(r"event_time::(-?\d+)", str(nm))
+        if m:
+            et[nm] = int(m.group(1))
+
+    z = stats.norm.ppf(1 - alpha / 2)
+    rows = []
+    for nm, e in et.items():
+        r = tidy.loc[nm]
+        est, se = float(r["Estimate"]), float(r["Std. Error"])
+        rows.append(
+            {
+                "event_time": e,
+                "estimate": est,
+                "se": se,
+                "ci_lower": est - z * se,
+                "ci_upper": est + z * se,
+            }
+        )
+    rows.append({"event_time": ref, "estimate": 0.0, "se": 0.0,
+                 "ci_lower": 0.0, "ci_upper": 0.0})
+    coefs = pd.DataFrame(rows).sort_values("event_time", ignore_index=True)
+
+    # Joint pre-trends Wald test: b' V^{-1} b over the lead coefficients.
+    lead_names = [nm for nm, e in et.items() if e < ref]
+    b = fit.coef().loc[lead_names].to_numpy()
+    V = fit._vcov
+    idx = [fit._coefnames.index(nm) for nm in lead_names]
+    Vsub = V[np.ix_(idx, idx)]
+    stat = float(b @ np.linalg.solve(Vsub, b))
+    df = len(lead_names)
+    pval = float(stats.chi2.sf(stat, df))
+    pre_rms = float(np.sqrt(np.mean(b**2)))
+
+    return StackedEventStudy(
+        coefs=coefs,
+        pretrends_stat=stat,
+        pretrends_pvalue=pval,
+        pretrends_df=df,
+        pre_rms=pre_rms,
+        n_stacks=len(matches),
+        n_obs=int(stack.shape[0]),
+        k_pre=k_pre,
+        k_post=k_post,
+        ref=ref,
+        alpha=alpha,
+    )
+
+
 __all__ = [
     "DiD2x2Result",
     "did_2x2",
@@ -778,4 +951,6 @@ __all__ = [
     "CSResult",
     "callaway_santanna",
     "goodman_bacon",
+    "StackedEventStudy",
+    "stacked_event_study",
 ]
