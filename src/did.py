@@ -773,6 +773,226 @@ def goodman_bacon(
 # --------------------------------------------------------------------------- #
 # Stacked event study (matched design) with a joint pre-trends Wald test
 # --------------------------------------------------------------------------- #
+def build_event_stack(
+    panel: pd.DataFrame,
+    matches: dict[str, list[str]],
+    *,
+    unit: str = "metro",
+    time: str = "period",
+    cohort: str = "cohort",
+    k_pre: int = 8,
+    k_post: int = 6,
+) -> pd.DataFrame:
+    """Assemble the stacked sub-experiment panel for a matched event study.
+
+    For each treated unit (key of ``matches``) one sub-experiment holds that
+    unit and its matched controls over ``[cohort - k_pre, cohort + k_post]``,
+    with ``event_time`` relative to the unit's cohort, a ``treated_num`` flag,
+    a ``stack_id``, and sub-experiment-specific ``unit_stack`` / ``time_stack``
+    labels. Shared by `stacked_event_study` and `wild_cluster_bootstrap_es` so
+    both operate on identical data.
+    """
+    cohort_of = panel.dropna(subset=[cohort]).groupby(unit)[cohort].first().to_dict()
+    parts = []
+    for host, controls in matches.items():
+        g = cohort_of.get(host)
+        if g is None:
+            raise ValueError(f"{host} has no cohort in the panel")
+        members = [host, *controls]
+        sub = panel[
+            panel[unit].isin(members) & panel[time].between(g - k_pre, g + k_post)
+        ].copy()
+        sub["event_time"] = (sub[time] - g).astype(int)
+        sub["treated_num"] = (sub[unit] == host).astype(int)
+        sub["stack_id"] = host
+        parts.append(sub)
+    stack = pd.concat(parts, ignore_index=True)
+    stack["unit_stack"] = stack[unit] + "__" + stack["stack_id"]
+    stack["time_stack"] = stack[time].astype(str) + "__" + stack["stack_id"]
+    return stack
+
+
+def _twoway_demean(
+    M: np.ndarray, fe1: np.ndarray, fe2: np.ndarray, tol: float = 1e-11, maxit: int = 5000
+) -> np.ndarray:
+    """Alternating-projections two-way demeaning of the columns of ``M``."""
+    X = M.astype(float).copy()
+    f1 = pd.Categorical(fe1).codes
+    f2 = pd.Categorical(fe2).codes
+    for _ in range(maxit):
+        X0 = X.copy()
+        X = X - pd.DataFrame(X).groupby(f1).transform("mean").to_numpy()
+        X = X - pd.DataFrame(X).groupby(f2).transform("mean").to_numpy()
+        if np.max(np.abs(X - X0)) < tol:
+            break
+    return X
+
+
+def _cluster_vcov(
+    R: np.ndarray, u: np.ndarray, clusters: np.ndarray, RtRi: np.ndarray
+) -> np.ndarray:
+    """Cluster-robust (CR1) covariance for a residualised design ``R``."""
+    k = R.shape[1]
+    uniq = np.unique(clusters)
+    G = len(uniq)
+    n = R.shape[0]
+    meat = np.zeros((k, k))
+    for g in uniq:
+        m = clusters == g
+        s = R[m].T @ u[m]
+        meat += np.outer(s, s)
+    adj = (G / (G - 1)) * ((n - 1) / (n - k))
+    return adj * (RtRi @ meat @ RtRi)
+
+
+@dataclass(frozen=True)
+class WildBootResult:
+    """Wild cluster bootstrap inference for a stacked event study.
+
+    Because the design has few *treated* clusters, the naive cluster-robust test
+    is anti-conservative (over-rejects). The restricted wild cluster bootstrap
+    (Rademacher weights, null imposed) is the honest fix named in
+    PROJECT_BRIEF.md §5.4. With very few treated clusters the bootstrap can in
+    turn be conservative, so naive and bootstrap p-values *bracket* the truth --
+    both are reported.
+    """
+
+    coef: dict[int, float]
+    p_naive: dict[int, float]
+    p_wcb: dict[int, float]
+    joint_pre_naive: float
+    joint_pre_wcb: float
+    n_clusters: int
+    n_treated_clusters: int
+    reps: int
+
+    def summary(self) -> str:
+        lines = [
+            f"Wild cluster bootstrap ({self.reps} reps, Rademacher, null imposed)",
+            f"  clusters: {self.n_clusters} total, {self.n_treated_clusters} treated",
+            f"  joint pre-trends p : naive {self.joint_pre_naive:.4f}  ->  "
+            f"WCB {self.joint_pre_wcb:.4f}",
+            "  key event-times (naive p -> WCB p):",
+        ]
+        for e in sorted(self.coef):
+            lines.append(
+                f"    e={e:>3}: {self.coef[e]:+.4f}   "
+                f"{self.p_naive[e]:.4f} -> {self.p_wcb[e]:.4f}"
+            )
+        return "\n".join(lines)
+
+    def __str__(self) -> str:  # pragma: no cover
+        return self.summary()
+
+
+def wild_cluster_bootstrap_es(
+    stack: pd.DataFrame,
+    *,
+    outcome: str = "log_lh",
+    unit: str = "metro",
+    treated: str = "treated_num",
+    event: str = "event_time",
+    ref: int = -1,
+    reps: int = 4999,
+    seed: int = 20260620,
+) -> WildBootResult:
+    """Restricted wild cluster bootstrap for a stacked event study.
+
+    Partials out the two-way (``unit_stack``, ``time_stack``) fixed effects by
+    alternating projections (Frisch-Waugh-Lovell), then bootstraps on the small
+    residualised system: for each replicate, cluster-level Rademacher weights are
+    applied to the *restricted* residuals (null imposed), the model is refit, and
+    the cluster-robust statistic is recomputed. Reports, for every event-time
+    coefficient, the naive cluster-robust p-value and the bootstrap p-value, plus
+    a joint pre-trends test of both kinds.
+    """
+    ets = sorted(e for e in stack[event].unique() if e != ref)
+    et_cols = [f"et_{e}" for e in ets]
+    M = np.column_stack(
+        [((stack[event] == e) & (stack[treated] == 1)).to_numpy(float) for e in ets]
+        + [stack[outcome].to_numpy(float)]
+    )
+    Md = _twoway_demean(M, stack["unit_stack"].to_numpy(), stack["time_stack"].to_numpy())
+    R, y = Md[:, :-1], Md[:, -1]
+    clusters = stack[unit].to_numpy()
+
+    RtRi = np.linalg.inv(R.T @ R)
+    P = RtRi @ R.T
+    beta = P @ y
+    u = y - R @ beta
+    V = _cluster_vcov(R, u, clusters, RtRi)
+
+    from scipy import stats as _stats
+
+    idx_of = {c: i for i, c in enumerate(et_cols)}
+    lead_cols = [f"et_{e}" for e in ets if e < ref]
+    lead_idx = [idx_of[c] for c in lead_cols]
+
+    def _fit_stats(yv):
+        b = P @ yv
+        uu = yv - R @ b
+        Vv = _cluster_vcov(R, uu, clusters, RtRi)
+        return b, Vv
+
+    # observed joint pre-trends Wald + per-coef t
+    b_lead = beta[lead_idx]
+    wald_obs = float(b_lead @ np.linalg.solve(V[np.ix_(lead_idx, lead_idx)], b_lead))
+    joint_pre_naive = float(_stats.chi2.sf(wald_obs, len(lead_idx)))
+    t_obs = {c: beta[i] / np.sqrt(V[i, i]) for c, i in idx_of.items()}
+    p_naive = {int(c.split("_")[1]): float(2 * _stats.norm.sf(abs(t_obs[c])))
+               for c in et_cols}
+
+    uniq = np.unique(clusters)
+    rng = np.random.default_rng(seed)
+
+    # restricted fits: for the joint test drop all leads; for each single coef drop that coef
+    def _restricted(drop_idx):
+        keep = [i for i in range(R.shape[1]) if i not in drop_idx]
+        Rr = R[:, keep]
+        br = np.linalg.solve(Rr.T @ Rr, Rr.T @ y)
+        yhat = Rr @ br
+        return yhat, y - yhat
+
+    yhat_joint, ur_joint = _restricted(lead_idx)
+    single_restr = {c: _restricted([idx_of[c]]) for c in et_cols}
+
+    cnt_joint = 0
+    cnt_single = {c: 0 for c in et_cols}
+    for _ in range(reps):
+        w = rng.choice([-1.0, 1.0], size=len(uniq))
+        wmap = dict(zip(uniq, w))
+        wv = np.array([wmap[c] for c in clusters])
+
+        ystar = yhat_joint + wv * ur_joint
+        bstar, Vstar = _fit_stats(ystar)
+        bl = bstar[lead_idx]
+        wald_s = float(bl @ np.linalg.solve(Vstar[np.ix_(lead_idx, lead_idx)], bl))
+        cnt_joint += wald_s >= wald_obs
+
+        for c in et_cols:
+            yhat_c, ur_c = single_restr[c]
+            ys = yhat_c + wv * ur_c
+            bs, Vs = _fit_stats(ys)
+            i = idx_of[c]
+            if abs(bs[i] / np.sqrt(Vs[i, i])) >= abs(t_obs[c]):
+                cnt_single[c] += 1
+
+    p_wcb = {int(c.split("_")[1]): (cnt_single[c] + 1) / (reps + 1) for c in et_cols}
+    joint_pre_wcb = (cnt_joint + 1) / (reps + 1)
+
+    n_treated = stack.loc[stack[treated] == 1, unit].nunique()
+    return WildBootResult(
+        coef={int(c.split("_")[1]): float(beta[idx_of[c]]) for c in et_cols},
+        p_naive=p_naive,
+        p_wcb=p_wcb,
+        joint_pre_naive=joint_pre_naive,
+        joint_pre_wcb=joint_pre_wcb,
+        n_clusters=len(uniq),
+        n_treated_clusters=n_treated,
+        reps=reps,
+    )
+
+
 @dataclass(frozen=True)
 class StackedEventStudy:
     """Result of a stacked (Cengiz et al. 2019) event-study estimation."""
@@ -860,26 +1080,10 @@ def stacked_event_study(
     import pyfixest as pf
     from scipy import stats
 
-    cohort_of = panel.dropna(subset=[cohort]).groupby(unit)[cohort].first().to_dict()
-
-    parts = []
-    for host, controls in matches.items():
-        g = cohort_of.get(host)
-        if g is None:
-            raise ValueError(f"{host} has no cohort in the panel")
-        members = [host, *controls]
-        sub = panel[
-            panel[unit].isin(members)
-            & panel[time].between(g - k_pre, g + k_post)
-        ].copy()
-        sub["event_time"] = (sub[time] - g).astype(int)
-        sub["treated_num"] = (sub[unit] == host).astype(int)
-        sub["stack_id"] = host
-        parts.append(sub)
-
-    stack = pd.concat(parts, ignore_index=True)
-    stack["unit_stack"] = stack[unit] + "__" + stack["stack_id"]
-    stack["time_stack"] = stack[time].astype(str) + "__" + stack["stack_id"]
+    stack = build_event_stack(
+        panel, matches, unit=unit, time=time, cohort=cohort,
+        k_pre=k_pre, k_post=k_post,
+    )
 
     vcov = {"CRV1": unit} if cluster else "iid"
     fit = pf.feols(
@@ -951,6 +1155,9 @@ __all__ = [
     "CSResult",
     "callaway_santanna",
     "goodman_bacon",
+    "build_event_stack",
     "StackedEventStudy",
     "stacked_event_study",
+    "WildBootResult",
+    "wild_cluster_bootstrap_es",
 ]
