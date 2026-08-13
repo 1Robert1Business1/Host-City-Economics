@@ -773,43 +773,213 @@ def goodman_bacon(
 # --------------------------------------------------------------------------- #
 # Stacked event study (matched design) with a joint pre-trends Wald test
 # --------------------------------------------------------------------------- #
-def build_event_stack(
+def _matches_to_assignments(
     panel: pd.DataFrame,
     matches: dict[str, list[str]],
     *,
+    unit: str,
+    cohort: str,
+    cohort_override: dict[str, float] | None,
+) -> list[tuple[str, list[str], float]]:
+    """Turn a ``{treated: controls}`` dict into explicit sub-experiment specs.
+
+    Each treated unit's cohort period is taken from ``cohort_override`` if
+    present, else from the panel's ``cohort`` column. This is what lets placebo
+    tests reuse the same builder: an in-time placebo overrides the cohort, an
+    in-space placebo names a control as the treated unit and supplies its cohort.
+    """
+    cohort_of = panel.dropna(subset=[cohort]).groupby(unit)[cohort].first().to_dict()
+    override = cohort_override or {}
+    out = []
+    for treated_unit, controls in matches.items():
+        g = override.get(treated_unit, cohort_of.get(treated_unit))
+        if g is None:
+            raise ValueError(f"{treated_unit} has no cohort (in panel or override)")
+        out.append((treated_unit, list(controls), float(g)))
+    return out
+
+
+def build_event_stack(
+    panel: pd.DataFrame,
+    matches: dict[str, list[str]] | None = None,
+    *,
+    assignments: list[tuple[str, list[str], float]] | None = None,
     unit: str = "metro",
     time: str = "period",
     cohort: str = "cohort",
     k_pre: int = 8,
     k_post: int = 6,
+    cohort_override: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     """Assemble the stacked sub-experiment panel for a matched event study.
 
-    For each treated unit (key of ``matches``) one sub-experiment holds that
-    unit and its matched controls over ``[cohort - k_pre, cohort + k_post]``,
-    with ``event_time`` relative to the unit's cohort, a ``treated_num`` flag,
-    a ``stack_id``, and sub-experiment-specific ``unit_stack`` / ``time_stack``
-    labels. Shared by `stacked_event_study` and `wild_cluster_bootstrap_es` so
-    both operate on identical data.
+    Each sub-experiment holds one treated unit and its controls over
+    ``[cohort - k_pre, cohort + k_post]``, carrying ``event_time`` relative to
+    that unit's cohort, a ``treated_num`` flag, and sub-experiment-specific
+    ``unit_stack`` / ``time_stack`` labels. Sub-experiments are keyed by
+    *position*, so the same control unit may recur across sub-experiments (as it
+    does under an in-space placebo) without collision. Shared by
+    `stacked_event_study`, `wild_cluster_bootstrap_es`, and the placebo tests, so
+    all operate on identical data.
+
+    Provide exactly one of ``matches`` (a ``{treated: controls}`` dict, with
+    cohorts read from the panel or ``cohort_override``) or ``assignments`` (an
+    explicit list of ``(treated_unit, controls, cohort_period)`` tuples, which
+    the placebos use directly).
     """
-    cohort_of = panel.dropna(subset=[cohort]).groupby(unit)[cohort].first().to_dict()
+    if (matches is None) == (assignments is None):
+        raise ValueError("pass exactly one of `matches` or `assignments`")
+    if assignments is None:
+        assignments = _matches_to_assignments(
+            panel, matches, unit=unit, cohort=cohort, cohort_override=cohort_override
+        )
+
     parts = []
-    for host, controls in matches.items():
-        g = cohort_of.get(host)
-        if g is None:
-            raise ValueError(f"{host} has no cohort in the panel")
-        members = [host, *controls]
+    for i, (treated_unit, controls, g) in enumerate(assignments):
+        members = [treated_unit, *controls]
         sub = panel[
             panel[unit].isin(members) & panel[time].between(g - k_pre, g + k_post)
         ].copy()
         sub["event_time"] = (sub[time] - g).astype(int)
-        sub["treated_num"] = (sub[unit] == host).astype(int)
-        sub["stack_id"] = host
+        sub["treated_num"] = (sub[unit] == treated_unit).astype(int)
+        sub["stack_id"] = f"x{i}"          # position-based -> duplicates allowed
         parts.append(sub)
     stack = pd.concat(parts, ignore_index=True)
     stack["unit_stack"] = stack[unit] + "__" + stack["stack_id"]
     stack["time_stack"] = stack[time].astype(str) + "__" + stack["stack_id"]
     return stack
+
+
+def stacked_event_coef(
+    stack: pd.DataFrame,
+    *,
+    at: int = 0,
+    outcome: str = "log_lh",
+    unit: str = "metro",
+    event: str = "event_time",
+    treated: str = "treated_num",
+    ref: int = -1,
+    cluster: bool = True,
+) -> tuple[float, float]:
+    """Fit a stacked event study and return ``(estimate, se)`` at event time ``at``.
+
+    The minimal read used by the placebo tests: it reuses the same specification
+    as `stacked_event_study` (sub-experiment two-way fixed effects, clustered on
+    ``unit``) but returns a single coefficient rather than the full table.
+    """
+    import pyfixest as pf
+
+    vcov = {"CRV1": unit} if cluster else "iid"
+    fit = pf.feols(
+        f"{outcome} ~ i({event}, {treated}, ref={ref}) | unit_stack + time_stack",
+        data=stack,
+        vcov=vcov,
+    )
+    prefix = f"{event}::{at}:"
+    name = next((c for c in fit.coef().index if str(c).startswith(prefix)), None)
+    if name is None:
+        raise KeyError(f"no event-study coefficient at {event}={at}")
+    return float(fit.coef()[name]), float(fit.se()[name])
+
+
+# --------------------------------------------------------------------------- #
+# Placebo / falsification tests
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class PlaceboSpaceResult:
+    """In-space (fake-treated-unit) placebo distribution."""
+
+    real: float
+    placebo: np.ndarray
+    pvalue: float
+    """Randomization-inference p: share of placebo effects at least as large in
+    magnitude as the real one. Design-based, so robust to few treated clusters."""
+
+    def summary(self) -> str:
+        beyond = float(np.mean(np.abs(self.placebo) < abs(self.real)) * 100)
+        return (
+            f"In-space placebo ({len(self.placebo)} draws): real {self.real:+.4f}, "
+            f"placebo mean {self.placebo.mean():+.4f}, real beyond {beyond:.0f}% of "
+            f"draws, p = {self.pvalue:.4f}"
+        )
+
+
+def placebo_in_time(
+    panel: pd.DataFrame,
+    matches: dict[str, list[str]],
+    *,
+    shift: int,
+    at: int = 0,
+    unit: str = "metro",
+    time: str = "period",
+    cohort: str = "cohort",
+    k_pre: int = 8,
+    k_post: int = 6,
+) -> float:
+    """In-time placebo: move every treatment date back ``shift`` periods.
+
+    If the estimated ``at`` effect appears at a date when nothing happened, the
+    design is picking up something other than the event (here, seasonality).
+    Returns the placebo event-study coefficient at event time ``at``.
+    """
+    cohort_of = panel.dropna(subset=[cohort]).groupby(unit)[cohort].first().to_dict()
+    override = {h: cohort_of[h] - shift for h in matches}
+    stack = build_event_stack(
+        panel, matches, unit=unit, time=time, cohort=cohort,
+        k_pre=k_pre, k_post=k_post, cohort_override=override,
+    )
+    est, _ = stacked_event_coef(stack, at=at, unit=unit, event="event_time")
+    return est
+
+
+def placebo_in_space(
+    panel: pd.DataFrame,
+    matches: dict[str, list[str]],
+    *,
+    reps: int = 500,
+    at: int = 0,
+    seed: int = 20260620,
+    unit: str = "metro",
+    time: str = "period",
+    cohort: str = "cohort",
+    k_pre: int = 8,
+    k_post: int = 6,
+) -> PlaceboSpaceResult:
+    """In-space placebo: reassign treatment to random control units.
+
+    For each replicate, every treated unit is replaced by one of its own matched
+    controls (the real treated unit is dropped from that sub-experiment), keeping
+    the real treatment dates. The real effect should sit in the tail of the
+    resulting placebo distribution. This is randomization inference — design-based
+    and so robust to the few-treated-clusters problem.
+    """
+    cohort_of = panel.dropna(subset=[cohort]).groupby(unit)[cohort].first().to_dict()
+
+    def _t0(assignments):
+        stack = build_event_stack(
+            panel, assignments=assignments, unit=unit, time=time,
+            k_pre=k_pre, k_post=k_post,
+        )
+        est, _ = stacked_event_coef(stack, at=at, unit=unit, event="event_time")
+        return est
+
+    real = _t0([(h, controls, float(cohort_of[h])) for h, controls in matches.items()])
+
+    rng = np.random.default_rng(seed)
+    placebo = []
+    for _ in range(reps):
+        asg = []
+        for h, controls in matches.items():
+            fake = rng.choice(controls)
+            others = [c for c in controls if c != fake]
+            asg.append((str(fake), others, float(cohort_of[h])))
+        try:
+            placebo.append(_t0(asg))
+        except (KeyError, ValueError):
+            continue
+    placebo = np.asarray(placebo)
+    pvalue = (np.sum(np.abs(placebo) >= abs(real)) + 1) / (len(placebo) + 1)
+    return PlaceboSpaceResult(real=float(real), placebo=placebo, pvalue=float(pvalue))
 
 
 def _twoway_demean(
@@ -1156,8 +1326,12 @@ __all__ = [
     "callaway_santanna",
     "goodman_bacon",
     "build_event_stack",
+    "stacked_event_coef",
     "StackedEventStudy",
     "stacked_event_study",
     "WildBootResult",
     "wild_cluster_bootstrap_es",
+    "PlaceboSpaceResult",
+    "placebo_in_time",
+    "placebo_in_space",
 ]
